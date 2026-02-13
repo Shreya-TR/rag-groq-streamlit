@@ -12,7 +12,7 @@ from main import (
     save_uploaded_to_temp,
 )
 
-st.set_page_config(page_title="Multimodal RAG with Groq + FAISS", page_icon="book", layout="wide")
+st.set_page_config(page_title="Multimodal RAG with Groq + FAISS", page_icon="📚", layout="wide")
 
 st.title("Advanced Multimodal RAG")
 st.caption("PDF + Image OCR + Audio Transcription -> Overlap Chunking -> FAISS Retrieval -> Groq Answering")

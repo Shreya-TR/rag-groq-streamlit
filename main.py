@@ -1,22 +1,27 @@
 import os
 import tempfile
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
-import faiss
 import numpy as np
 import pdfplumber
 import pytesseract
-import whisper
 from PIL import Image
-from sentence_transformers import SentenceTransformer
 
 try:
     from groq import Groq
 except ImportError:
     Groq = None
 
+_EMBEDDER = None
 
-EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
+
+def _get_embedder():
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        from sentence_transformers import SentenceTransformer
+
+        _EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
+    return _EMBEDDER
 
 
 def extract_pdf_text(path: str) -> str:
@@ -34,6 +39,8 @@ def extract_image_text(path: str) -> str:
 
 
 def extract_audio_text(path: str, model_size: str = "base") -> str:
+    import whisper
+
     model = whisper.load_model(model_size)
     return model.transcribe(path).get("text", "").strip()
 
@@ -52,18 +59,20 @@ def chunk_text(text: str, chunk_size: int = 350, overlap: int = 70) -> List[str]
     ]
 
 
-def build_faiss_index(chunks: List[str]) -> Tuple[faiss.IndexFlatL2, List[str]]:
+def build_faiss_index(chunks: List[str]) -> Tuple[Any, List[str]]:
+    import faiss
+
     if not chunks:
         raise ValueError("No chunks found to index.")
-    embeddings = EMBEDDER.encode(chunks, convert_to_numpy=True)
+    embeddings = _get_embedder().encode(chunks, convert_to_numpy=True)
     embeddings = np.asarray(embeddings, dtype=np.float32)
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
     return index, chunks
 
 
-def retrieve(query: str, index: faiss.IndexFlatL2, chunks: List[str], top_k: int = 3) -> List[str]:
-    q_emb = EMBEDDER.encode([query], convert_to_numpy=True)
+def retrieve(query: str, index: Any, chunks: List[str], top_k: int = 3) -> List[str]:
+    q_emb = _get_embedder().encode([query], convert_to_numpy=True)
     q_emb = np.asarray(q_emb, dtype=np.float32)
     top_k = min(top_k, len(chunks))
     _, idxs = index.search(q_emb, top_k)
@@ -77,7 +86,7 @@ def _resolve_client_and_model():
     return None, None, None
 
 
-def generate_answer(query: str, index: faiss.IndexFlatL2, chunks: List[str]) -> str:
+def generate_answer(query: str, index: Any, chunks: List[str]) -> str:
     contexts = retrieve(query, index, chunks, top_k=4)
     if not contexts:
         return "I could not find relevant context for your question."
@@ -111,4 +120,3 @@ def save_uploaded_to_temp(uploaded_file) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.getbuffer())
         return tmp.name
-
