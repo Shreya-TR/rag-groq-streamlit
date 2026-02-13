@@ -1,0 +1,8 @@
+openai
+pdfplumber
+pytesseract
+Pillow
+openai-whisper
+sentence-transformers
+faiss-cpu
+streamlit
