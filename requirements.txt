@@ -3,3 +3,6 @@ pytesseract
 Pillow
 streamlit
 groq
+numpy
+requests
+faiss-cpu; python_version < "3.13"
