@@ -91,7 +91,7 @@ def build_faiss_index(chunks: List[str]) -> Tuple[Any, List[str]]:
     return _build_sparse_vectors(chunks)
 
 
-def retrieve(query: str, index: Any, chunks: List[str], top_k: int = 3) -> List[str]:
+def retrieve_with_scores(query: str, index: Any, chunks: List[str], top_k: int = 3) -> List[Tuple[str, float, int]]:
     query_vec = dict(Counter(_tokenize(query)))
     scored: List[Tuple[float, int]] = []
 
@@ -100,11 +100,20 @@ def retrieve(query: str, index: Any, chunks: List[str], top_k: int = 3) -> List[
         scored.append((score, i))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [i for score, i in scored[: max(1, min(top_k, len(scored)))] if score > 0]
+    take_n = max(1, min(top_k, len(scored)))
+    top_scored = [(score, idx) for score, idx in scored[:take_n] if score > 0]
 
-    if not top:
-        return chunks[: min(top_k, len(chunks))]
-    return [chunks[i] for i in top]
+    if not top_scored:
+        fallback = []
+        for idx in range(min(top_k, len(chunks))):
+            fallback.append((chunks[idx], 0.0, idx))
+        return fallback
+
+    return [(chunks[idx], float(score), idx) for score, idx in top_scored]
+
+
+def retrieve(query: str, index: Any, chunks: List[str], top_k: int = 3) -> List[str]:
+    return [text for text, _, _ in retrieve_with_scores(query, index, chunks, top_k=top_k)]
 
 
 def _resolve_client_and_model():
@@ -114,15 +123,28 @@ def _resolve_client_and_model():
     return None, None, None
 
 
-def generate_answer(query: str, index: Any, chunks: List[str]) -> str:
+def generate_answer(query: str, index: Any, chunks: List[str], history: List[Dict[str, str]] | None = None) -> str:
     contexts = retrieve(query, index, chunks, top_k=4)
     if not contexts:
         return "I could not find relevant context for your question."
 
     context = "\n\n".join(contexts)
+    history_text = ""
+    if history:
+        last_turns = history[-4:]
+        formatted = []
+        for turn in last_turns:
+            user_q = turn.get("question", "").strip()
+            assistant_a = turn.get("answer", "").strip()
+            if user_q or assistant_a:
+                formatted.append(f"User: {user_q}\nAssistant: {assistant_a}")
+        if formatted:
+            history_text = "Conversation so far:\n" + "\n\n".join(formatted) + "\n\n"
+
     prompt = (
         "You are a helpful assistant for a RAG app.\n"
         "Answer only from the provided context. If context is insufficient, say so clearly.\n\n"
+        f"{history_text}"
         f"Context:\n{context}\n\n"
         f"Question: {query}"
     )
@@ -141,6 +163,27 @@ def generate_answer(query: str, index: Any, chunks: List[str]) -> str:
         "Top retrieved context:\n"
         f"{contexts[0]}"
     )
+
+
+def summarize_document(chunks: List[str]) -> str:
+    if not chunks:
+        return "No content available for summary."
+
+    preview = "\n\n".join(chunks[:4])
+    client, model, provider = _resolve_client_and_model()
+    if provider == "groq":
+        prompt = (
+            "Summarize this document in 5 concise bullets and then provide a 1-line abstract.\n\n"
+            f"Content:\n{preview}"
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content
+
+    return "Summary requires GROQ_API_KEY. Set it in Streamlit secrets to enable document summarization."
 
 
 def save_uploaded_to_temp(uploaded_file) -> str:
