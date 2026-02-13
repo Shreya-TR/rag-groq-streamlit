@@ -91,13 +91,17 @@ def train(cfg: TrainConfig):
         report_to=[],
     )
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": tokenized,
+        "data_collator": data_collator,
+    }
+    # transformers<5 accepted `tokenizer`; transformers>=5 removed it.
+    try:
+        trainer = Trainer(tokenizer=tokenizer, **trainer_kwargs)
+    except TypeError:
+        trainer = Trainer(**trainer_kwargs)
     train_result = trainer.train()
     trainer.save_model(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)

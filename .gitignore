@@ -1,0 +1,7 @@
+finetune_outputs/
+.rag_store/
+.pytest_cache/
+__pycache__/
+rag/__pycache__/
+tests/__pycache__/
+finetune/__pycache__/
