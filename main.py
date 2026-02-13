@@ -116,6 +116,38 @@ def retrieve(query: str, index: Any, chunks: List[str], top_k: int = 3) -> List[
     return [text for text, _, _ in retrieve_with_scores(query, index, chunks, top_k=top_k)]
 
 
+def _normalize_query(query: str) -> str:
+    return " ".join(query.strip().split())
+
+
+def expand_query_variants(query: str) -> List[str]:
+    base = _normalize_query(query)
+    if not base:
+        return []
+    variants = [base]
+    variants.append(f"{base} definition")
+    variants.append(f"key points about {base}")
+    return list(dict.fromkeys(variants))
+
+
+def retrieve_multi_query_with_scores(
+    query: str, index: Any, chunks: List[str], top_k: int = 4
+) -> List[Tuple[str, float, int]]:
+    variants = expand_query_variants(query)
+    if not variants:
+        return []
+
+    best_by_idx: Dict[int, Tuple[str, float, int]] = {}
+    for v in variants:
+        for text, score, idx in retrieve_with_scores(v, index, chunks, top_k=top_k):
+            prev = best_by_idx.get(idx)
+            if prev is None or score > prev[1]:
+                best_by_idx[idx] = (text, score, idx)
+
+    merged = sorted(best_by_idx.values(), key=lambda x: x[1], reverse=True)
+    return merged[: max(1, top_k)]
+
+
 def _resolve_client_and_model():
     api_key = os.getenv("GROQ_API_KEY")
     if api_key and Groq is not None:
@@ -123,8 +155,16 @@ def _resolve_client_and_model():
     return None, None, None
 
 
-def generate_answer(query: str, index: Any, chunks: List[str], history: List[Dict[str, str]] | None = None) -> str:
-    contexts = retrieve(query, index, chunks, top_k=4)
+def generate_answer(
+    query: str,
+    index: Any,
+    chunks: List[str],
+    history: List[Dict[str, str]] | None = None,
+    answer_mode: str = "detailed",
+    contexts: List[str] | None = None,
+) -> str:
+    if contexts is None:
+        contexts = retrieve(query, index, chunks, top_k=4)
     if not contexts:
         return "I could not find relevant context for your question."
 
@@ -141,9 +181,14 @@ def generate_answer(query: str, index: Any, chunks: List[str], history: List[Dic
         if formatted:
             history_text = "Conversation so far:\n" + "\n\n".join(formatted) + "\n\n"
 
+    style_line = "Give a concise 3-5 sentence answer."
+    if answer_mode == "detailed":
+        style_line = "Give a structured detailed answer with short headings and bullets when useful."
+
     prompt = (
         "You are a helpful assistant for a RAG app.\n"
         "Answer only from the provided context. If context is insufficient, say so clearly.\n\n"
+        f"{style_line}\n\n"
         f"{history_text}"
         f"Context:\n{context}\n\n"
         f"Question: {query}"
@@ -184,6 +229,34 @@ def summarize_document(chunks: List[str]) -> str:
         return resp.choices[0].message.content
 
     return "Summary requires GROQ_API_KEY. Set it in Streamlit secrets to enable document summarization."
+
+
+def suggest_eval_questions(chunks: List[str], n: int = 5) -> List[str]:
+    if not chunks:
+        return []
+    sample = "\n\n".join(chunks[:5])
+    client, model, provider = _resolve_client_and_model()
+    if provider == "groq":
+        prompt = (
+            f"Create {n} clear evaluation questions answerable from this content. "
+            "Output one question per line only.\n\n"
+            f"Content:\n{sample}"
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        lines = [ln.strip("- ").strip() for ln in resp.choices[0].message.content.splitlines()]
+        return [ln for ln in lines if ln.endswith("?")][:n]
+
+    return [
+        "What is the main topic of the uploaded content?",
+        "List the most important key points discussed.",
+        "What process or workflow is described?",
+        "What limitations or challenges are mentioned?",
+        "What conclusion can be drawn from the content?",
+    ][:n]
 
 
 def save_uploaded_to_temp(uploaded_file) -> str:

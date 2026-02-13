@@ -10,8 +10,10 @@ from main import (
     extract_image_text,
     extract_pdf_text,
     generate_answer,
+    retrieve_multi_query_with_scores,
     retrieve_with_scores,
     save_uploaded_to_temp,
+    suggest_eval_questions,
     summarize_document,
 )
 
@@ -32,7 +34,7 @@ st.markdown(
     """
     <div class="hero">
       <h2 style="margin:0;">Advanced Multimodal RAG</h2>
-      <p style="margin:0.3rem 0 0 0;">PDF + Image OCR + Audio Transcription -> Overlap Chunking -> Retrieval -> Groq Answering</p>
+      <p style="margin:0.3rem 0 0 0;">PDF + Image OCR + Audio -> Overlap Chunking -> Multi-Query Retrieval -> Groq Grounded Answering</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -43,10 +45,12 @@ with st.sidebar:
     chunk_size = st.slider("Chunk size (words)", min_value=150, max_value=700, value=350, step=25)
     overlap = st.slider("Chunk overlap (words)", min_value=0, max_value=200, value=70, step=10)
     top_k = st.slider("Top chunks for retrieval", min_value=2, max_value=8, value=4)
+    answer_mode = st.radio("Answer style", options=["detailed", "concise"], horizontal=True)
+    use_multi_query = st.toggle("Enable multi-query retrieval", value=True)
     st.markdown("---")
     st.markdown("Supported: `pdf`, `png`, `jpg`, `jpeg`, `wav`, `mp3`, `m4a`")
     if not os.getenv("GROQ_API_KEY"):
-        st.warning("`GROQ_API_KEY` missing: app will run in retrieval-only fallback mode.")
+        st.warning("`GROQ_API_KEY` missing: app runs with retrieval fallback.")
 
 uploaded_files = st.file_uploader(
     "Upload one or more files",
@@ -66,6 +70,8 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "doc_summary" not in st.session_state:
     st.session_state.doc_summary = ""
+if "eval_questions" not in st.session_state:
+    st.session_state.eval_questions = []
 
 if uploaded_files and st.button("Process Files", type="primary"):
     with st.spinner("Extracting text and building retrieval index..."):
@@ -96,6 +102,7 @@ if uploaded_files and st.button("Process Files", type="primary"):
             st.session_state.chunks = []
             st.session_state.corpus_text = ""
             st.session_state.doc_summary = ""
+            st.session_state.eval_questions = []
             st.error("No text could be extracted from uploaded files.")
         else:
             chunks = chunk_text(full_text, chunk_size=chunk_size, overlap=overlap)
@@ -104,6 +111,7 @@ if uploaded_files and st.button("Process Files", type="primary"):
                 st.session_state.chunks = []
                 st.session_state.corpus_text = ""
                 st.session_state.doc_summary = ""
+                st.session_state.eval_questions = []
                 st.error("Chunking produced no chunks. Try reducing overlap or uploading more text.")
             else:
                 index, chunks = build_faiss_index(chunks)
@@ -113,6 +121,7 @@ if uploaded_files and st.button("Process Files", type="primary"):
                 st.session_state.ingest_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 st.session_state.chat_history = []
                 st.session_state.doc_summary = summarize_document(chunks)
+                st.session_state.eval_questions = suggest_eval_questions(chunks, n=5)
                 st.success(f"Processed {processed} file(s) and built {len(chunks)} chunks.")
 
 if st.session_state.chunks:
@@ -126,58 +135,106 @@ if st.session_state.chunks:
         ingest_time = st.session_state.ingest_time or "-"
         st.markdown(f"<div class='metric-card'><b>Indexed at</b><br>{ingest_time}</div>", unsafe_allow_html=True)
 
-if st.session_state.doc_summary:
-    with st.expander("Document Summary", expanded=False):
-        st.write(st.session_state.doc_summary)
+tab_qa, tab_eval = st.tabs(["Q&A Studio", "Evaluation"])
 
-query = st.text_input("Ask a question from your uploaded content")
-if query:
-    if st.session_state.index is None:
-        st.info("Upload and process files first.")
-    else:
-        with st.spinner("Retrieving and generating answer..."):
-            sources = retrieve_with_scores(query, st.session_state.index, st.session_state.chunks, top_k=top_k)
-            answer = generate_answer(
-                query,
-                st.session_state.index,
-                st.session_state.chunks,
-                history=st.session_state.chat_history,
+with tab_qa:
+    if st.session_state.doc_summary:
+        with st.expander("Document Summary", expanded=False):
+            st.write(st.session_state.doc_summary)
+
+    query = st.text_input("Ask a question from your uploaded content")
+    if query:
+        if st.session_state.index is None:
+            st.info("Upload and process files first.")
+        else:
+            with st.spinner("Retrieving and generating answer..."):
+                if use_multi_query:
+                    sources = retrieve_multi_query_with_scores(query, st.session_state.index, st.session_state.chunks, top_k=top_k)
+                else:
+                    sources = retrieve_with_scores(query, st.session_state.index, st.session_state.chunks, top_k=top_k)
+                context_texts = [text for text, _, _ in sources]
+                answer = generate_answer(
+                    query,
+                    st.session_state.index,
+                    st.session_state.chunks,
+                    history=st.session_state.chat_history,
+                    answer_mode=answer_mode,
+                    contexts=context_texts,
+                )
+
+            citations = [f"[Chunk {chunk_idx + 1} | score={score:.3f}]" for _, score, chunk_idx in sources]
+            avg_score = sum([s for _, s, _ in sources]) / max(1, len(sources))
+            st.subheader("Answer")
+            st.write(answer)
+            st.caption("Citations: " + " ".join(citations))
+            st.caption(f"Retrieval quality (avg score): {avg_score:.3f}")
+
+            with st.expander("Retrieved Sources"):
+                for rank, (src, score, chunk_idx) in enumerate(sources, start=1):
+                    st.markdown(f"**Chunk {chunk_idx + 1} | Rank {rank} | Score {score:.3f}**")
+                    st.write(src[:1200] + ("..." if len(src) > 1200 else ""))
+
+            st.session_state.chat_history.append(
+                {
+                    "question": query,
+                    "answer": answer,
+                    "citations": " ".join(citations),
+                }
             )
 
-        citations = [f"[Chunk {chunk_idx + 1} | score={score:.3f}]" for _, score, chunk_idx in sources]
-        st.subheader("Answer")
-        st.write(answer)
-        st.caption("Citations: " + " ".join(citations))
+            report = f"Question: {query}\n\nAnswer:\n{answer}\n\nCitations:\n{' '.join(citations)}\n\n---\nRetrieved Sources:\n\n" + "\n\n".join(
+                [f"[Chunk {chunk_idx + 1} | Score {score:.3f}] {text}" for text, score, chunk_idx in sources]
+            )
+            st.download_button(
+                label="Download Q&A Report",
+                data=report,
+                file_name="rag_answer_report.txt",
+                mime="text/plain",
+            )
 
-        with st.expander("Retrieved Sources"):
-            for rank, (src, score, chunk_idx) in enumerate(sources, start=1):
-                st.markdown(f"**Chunk {chunk_idx + 1} | Rank {rank} | Score {score:.3f}**")
-                st.write(src[:1200] + ("..." if len(src) > 1200 else ""))
+    if st.session_state.chat_history:
+        st.subheader("Conversation Memory")
+        if st.button("Clear Chat History"):
+            st.session_state.chat_history = []
+            st.rerun()
+        for i, turn in enumerate(st.session_state.chat_history[-8:], start=1):
+            st.markdown(f"**Q{i}:** {turn['question']}")
+            st.markdown(f"**A{i}:** {turn['answer']}")
+            st.caption(turn.get("citations", ""))
 
-        st.session_state.chat_history.append(
-            {
-                "question": query,
-                "answer": answer,
-                "citations": " ".join(citations),
-            }
-        )
+with tab_eval:
+    st.markdown("### Auto Evaluation Questions")
+    if st.session_state.index is None:
+        st.info("Upload and process files to run evaluation.")
+    else:
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            st.write("Generated benchmark questions from your own corpus.")
+        with col_b:
+            if st.button("Refresh Questions"):
+                st.session_state.eval_questions = suggest_eval_questions(st.session_state.chunks, n=5)
+                st.rerun()
 
-        report = f"Question: {query}\n\nAnswer:\n{answer}\n\nCitations:\n{' '.join(citations)}\n\n---\nRetrieved Sources:\n\n" + "\n\n".join(
-            [f"[Chunk {chunk_idx + 1} | Score {score:.3f}] {text}" for text, score, chunk_idx in sources]
-        )
-        st.download_button(
-            label="Download Q&A Report",
-            data=report,
-            file_name="rag_answer_report.txt",
-            mime="text/plain",
-        )
+        if not st.session_state.eval_questions:
+            st.session_state.eval_questions = suggest_eval_questions(st.session_state.chunks, n=5)
 
-if st.session_state.chat_history:
-    st.subheader("Conversation Memory")
-    if st.button("Clear Chat History"):
-        st.session_state.chat_history = []
-        st.rerun()
-    for i, turn in enumerate(st.session_state.chat_history[-8:], start=1):
-        st.markdown(f"**Q{i}:** {turn['question']}")
-        st.markdown(f"**A{i}:** {turn['answer']}")
-        st.caption(turn.get("citations", ""))
+        results = []
+        for q in st.session_state.eval_questions:
+            sources = retrieve_with_scores(q, st.session_state.index, st.session_state.chunks, top_k=top_k)
+            context_texts = [text for text, _, _ in sources]
+            ans = generate_answer(
+                q,
+                st.session_state.index,
+                st.session_state.chunks,
+                history=[],
+                answer_mode="concise",
+                contexts=context_texts,
+            )
+            avg_score = sum([s for _, s, _ in sources]) / max(1, len(sources))
+            results.append({"question": q, "avg_retrieval_score": round(avg_score, 3), "answer_preview": ans[:180]})
+
+        for row in results:
+            st.markdown(f"**Q:** {row['question']}")
+            st.caption(f"Avg retrieval score: {row['avg_retrieval_score']}")
+            st.write(row["answer_preview"] + ("..." if len(row["answer_preview"]) >= 180 else ""))
+            st.markdown("---")
