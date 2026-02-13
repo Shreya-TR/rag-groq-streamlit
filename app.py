@@ -8,7 +8,7 @@ from main import build_index, generate_eval_set, load_persisted_index, run_query
 from rag.eval import pass_fail, retrieval_metrics
 from rag.ingest import ingest_files
 
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="📊", layout="wide")
 
 st.markdown(
     """
@@ -56,6 +56,12 @@ if "ingest_stats" not in st.session_state:
     st.session_state.ingest_stats = {}
 if "index_latency" not in st.session_state:
     st.session_state.index_latency = {}
+if "benchmark_rows" not in st.session_state:
+    st.session_state.benchmark_rows = []
+if "benchmark_summaries" not in st.session_state:
+    st.session_state.benchmark_summaries = {}
+if "benchmark_full" not in st.session_state:
+    st.session_state.benchmark_full = {}
 
 if load_saved:
     loaded = load_persisted_index()
@@ -221,6 +227,7 @@ with tab_analyst:
     if not st.session_state.index_ready:
         st.info("Build index first to run analyst workflows.")
     else:
+        experiment_label = st.text_input("Experiment label", value="baseline_rag")
         col_l, col_r = st.columns([1, 1])
         with col_l:
             if st.button("Refresh Benchmark Questions"):
@@ -245,7 +252,84 @@ with tab_analyst:
                         "verdict": verdict,
                     }
                 )
-            st.dataframe(rows, use_container_width=True)
+            total = len(rows)
+            pass_count = sum(1 for r in rows if r["verdict"] == "PASS")
+            pass_pct = round((pass_count / total) * 100, 2) if total else 0.0
+            avg_conf = round(sum(r["confidence"] for r in rows) / total, 3) if total else 0.0
+            avg_rerank = round(sum(r["avg_rerank"] for r in rows) / total, 3) if total else 0.0
+            avg_latency = round(sum(r["latency_ms"] for r in rows) / total, 2) if total else 0.0
+
+            summary = {
+                "experiment": experiment_label.strip() or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
+                "questions": total,
+                "pass_count": pass_count,
+                "pass_pct": pass_pct,
+                "avg_confidence": avg_conf,
+                "avg_retrieval_score": avg_rerank,
+                "avg_latency_ms": avg_latency,
+            }
+            st.session_state.benchmark_rows = rows
+            st.session_state.benchmark_summaries[summary["experiment"]] = summary
+            st.session_state.benchmark_full[summary["experiment"]] = rows
+            st.success(f"Saved benchmark run: {summary['experiment']} (PASS {pass_pct}%)")
+
+        if st.session_state.benchmark_rows:
+            st.dataframe(st.session_state.benchmark_rows, use_container_width=True)
+
+        if st.session_state.benchmark_summaries:
+            st.markdown("#### Benchmark Summary Runs")
+            summary_rows = list(st.session_state.benchmark_summaries.values())
+            st.dataframe(summary_rows, use_container_width=True)
+
+            latest_key = list(st.session_state.benchmark_summaries.keys())[-1]
+            latest_summary = st.session_state.benchmark_summaries[latest_key]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("PASS %", f"{latest_summary['pass_pct']}%")
+            c2.metric("Avg Confidence", latest_summary["avg_confidence"])
+            c3.metric("Avg Retrieval Score", latest_summary["avg_retrieval_score"])
+            c4.metric("Avg Latency (ms)", latest_summary["avg_latency_ms"])
+
+            bench_payload = {
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "latest_experiment": latest_key,
+                "summary": latest_summary,
+                "rows": st.session_state.benchmark_full.get(latest_key, []),
+            }
+            st.download_button(
+                "Download Latest Benchmark JSON",
+                data=json.dumps(bench_payload, indent=2),
+                file_name=f"benchmark_{latest_key}.json",
+                mime="application/json",
+            )
+
+            keys = list(st.session_state.benchmark_summaries.keys())
+            if len(keys) >= 2:
+                st.markdown("#### Before vs After Comparison")
+                base_key = st.selectbox("Baseline run", options=keys, index=0, key="cmp_base")
+                after_key = st.selectbox("After run", options=keys, index=len(keys) - 1, key="cmp_after")
+                base = st.session_state.benchmark_summaries[base_key]
+                after = st.session_state.benchmark_summaries[after_key]
+                comparison = [
+                    {"metric": "avg_retrieval_score", "baseline": base["avg_retrieval_score"], "after": after["avg_retrieval_score"], "delta": round(after["avg_retrieval_score"] - base["avg_retrieval_score"], 3)},
+                    {"metric": "avg_confidence", "baseline": base["avg_confidence"], "after": after["avg_confidence"], "delta": round(after["avg_confidence"] - base["avg_confidence"], 3)},
+                    {"metric": "pass_pct", "baseline": base["pass_pct"], "after": after["pass_pct"], "delta": round(after["pass_pct"] - base["pass_pct"], 2)},
+                    {"metric": "avg_latency_ms", "baseline": base["avg_latency_ms"], "after": after["avg_latency_ms"], "delta": round(after["avg_latency_ms"] - base["avg_latency_ms"], 2)},
+                ]
+                st.dataframe(comparison, use_container_width=True)
+                st.download_button(
+                    "Download Comparison JSON",
+                    data=json.dumps(
+                        {
+                            "generated_at": datetime.utcnow().isoformat() + "Z",
+                            "baseline": base,
+                            "after": after,
+                            "comparison": comparison,
+                        },
+                        indent=2,
+                    ),
+                    file_name=f"comparison_{base_key}_vs_{after_key}.json",
+                    mime="application/json",
+                )
 
         st.markdown("### Side-by-Side Modality Comparison")
         cmp_query = st.text_input("Comparison query", key="cmp_query")
