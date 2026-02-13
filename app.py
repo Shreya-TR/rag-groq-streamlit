@@ -4,11 +4,11 @@ from datetime import datetime
 import streamlit as st
 
 from config import APP_TITLE, CHUNK_OVERLAP, CHUNK_SIZE, TOP_K_RETRIEVE
-from main import build_index, generate_eval_set, run_query, summarize
+from main import build_index, generate_eval_set, load_persisted_index, run_query, summarize
 from rag.eval import pass_fail, retrieval_metrics
 from rag.ingest import ingest_files
 
-st.set_page_config(page_title=APP_TITLE, page_icon="📚", layout="wide")
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 st.markdown(
     """
@@ -25,7 +25,7 @@ st.markdown(
     """
     <div class="hero">
       <h2 style="margin:0;">Enterprise Copilot + Analyst Multimodal RAG</h2>
-      <p style="margin:0.3rem 0 0 0;">Dense Embeddings + Retrieval + Reranking + Grounded Generation + Evidence Trace</p>
+      <p style="margin:0.3rem 0 0 0;">Dense Embeddings + Persistent Index + Model Reranking + Grounded Generation</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -38,6 +38,7 @@ with st.sidebar:
     modality_filter = st.selectbox("Modality filter", options=["all", "text", "image", "audio"])
     st.caption(f"Chunk defaults: size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}")
     st.caption("Required secrets: GROQ_API_KEY, JINA_API_KEY")
+    load_saved = st.button("Load Persisted Index")
 
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
@@ -53,10 +54,29 @@ if "ingest_latency" not in st.session_state:
     st.session_state.ingest_latency = {}
 if "ingest_stats" not in st.session_state:
     st.session_state.ingest_stats = {}
+if "index_latency" not in st.session_state:
+    st.session_state.index_latency = {}
+
+if load_saved:
+    loaded = load_persisted_index()
+    if loaded is None:
+        st.warning("No persisted index found yet. Build index once to create it.")
+    else:
+        st.session_state.chunks = loaded.chunks
+        st.session_state.index_ready = True
+        st.session_state.chat_history = []
+        st.session_state.doc_summary = summarize(loaded.chunks)
+        st.session_state.eval_questions = generate_eval_set(loaded.chunks, n=5)
+        stats = {"text": 0, "image": 0, "audio": 0}
+        for c in loaded.chunks:
+            if c.modality in stats:
+                stats[c.modality] += 1
+        st.session_state.ingest_stats = stats
+        st.success(f"Loaded persisted index with {len(loaded.chunks)} chunks.")
 
 uploaded_files = st.file_uploader(
     "Upload source files",
-    type=["pdf", "png", "jpg", "jpeg", "wav", "mp3", "m4a"],
+    type=["pdf", "txt", "png", "jpg", "jpeg", "wav", "mp3", "m4a"],
     accept_multiple_files=True,
 )
 
@@ -70,7 +90,8 @@ if uploaded_files and st.button("Process & Build Index", type="primary"):
             st.session_state.index_ready = False
             st.error("No extractable content found in uploaded files.")
         else:
-            build_index(chunks)
+            _, index_latency = build_index(chunks, with_latency=True)
+            st.session_state.index_latency = index_latency
             st.session_state.chunks = chunks
             st.session_state.index_ready = True
             st.session_state.chat_history = []
@@ -87,7 +108,8 @@ if st.session_state.index_ready:
         unsafe_allow_html=True,
     )
     c3.markdown(
-        f"<div class='kpi'><b>Ingest latency</b><br>{st.session_state.ingest_latency.get('ingest_ms', 0)} ms</div>",
+        f"<div class='kpi'><b>Ingest + Index</b><br>{st.session_state.ingest_latency.get('ingest_ms', 0)} + "
+        f"{st.session_state.index_latency.get('index_build_ms', 0)} ms</div>",
         unsafe_allow_html=True,
     )
     c4.markdown(
@@ -130,7 +152,16 @@ with tab_copilot:
                     st.write(e.text[:1400] + ("..." if len(e.text) > 1400 else ""))
 
             with st.expander("Latency + Quality Diagnostics"):
-                st.write(latency)
+                st.write(
+                    {
+                        "query_embed_ms": latency.get("query_embed_ms", 0),
+                        "vector_search_ms": latency.get("vector_search_ms", 0),
+                        "rerank_ms": latency.get("rerank_ms", 0),
+                        "rerank_mode": latency.get("rerank_mode", "unknown"),
+                        "generation_ms": latency.get("generation_ms", 0),
+                        "total_query_ms": latency.get("total_query_ms", 0),
+                    }
+                )
                 st.write(metrics)
 
             st.session_state.chat_history.append(
@@ -208,6 +239,8 @@ with tab_analyst:
                         "question": eq,
                         "confidence": round(ans.confidence, 3),
                         "avg_rerank": retrieval_metrics(ev)["avg_score"],
+                        "query_embed_ms": lat.get("query_embed_ms", 0),
+                        "generation_ms": lat.get("generation_ms", 0),
                         "latency_ms": lat.get("total_query_ms", 0),
                         "verdict": verdict,
                     }

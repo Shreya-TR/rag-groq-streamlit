@@ -1,10 +1,15 @@
 import os
+import time
 from typing import List
 
 import numpy as np
-import requests
 
 from config import EMBEDDING_MODEL
+
+try:
+    import requests
+except ImportError:
+    requests = None
 
 
 def _fallback_embed(texts: List[str], dim: int = 512) -> np.ndarray:
@@ -19,7 +24,7 @@ def _fallback_embed(texts: List[str], dim: int = 512) -> np.ndarray:
 
 def embed_texts(texts: List[str]) -> np.ndarray:
     api_key = os.getenv("JINA_API_KEY")
-    if not api_key:
+    if not api_key or requests is None:
         return _fallback_embed(texts)
 
     url = "https://api.jina.ai/v1/embeddings"
@@ -34,3 +39,10 @@ def embed_texts(texts: List[str]) -> np.ndarray:
         return arr
     except Exception:
         return _fallback_embed(texts)
+
+
+def embed_texts_with_timing(texts: List[str]) -> tuple[np.ndarray, float]:
+    t0 = time.perf_counter()
+    emb = embed_texts(texts)
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+    return emb, elapsed_ms

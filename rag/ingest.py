@@ -4,10 +4,6 @@ import time
 import uuid
 from typing import Dict, List, Tuple
 
-import pdfplumber
-import pytesseract
-from PIL import Image
-
 from config import ASR_MODEL, CHUNK_OVERLAP, CHUNK_SIZE
 from rag.chunking import chunk_text
 from rag.types import DocumentChunk
@@ -47,6 +43,8 @@ def ingest_files(uploaded_files) -> Tuple[List[DocumentChunk], Dict[str, float],
         lname = name.lower()
 
         if lname.endswith(".pdf"):
+            import pdfplumber
+
             with pdfplumber.open(path) as pdf:
                 for page_i, page in enumerate(pdf.pages, start=1):
                     text = (page.extract_text() or "").strip()
@@ -65,7 +63,30 @@ def ingest_files(uploaded_files) -> Tuple[List[DocumentChunk], Dict[str, float],
                         )
                         stats["text"] += 1
 
+        elif lname.endswith(".txt"):
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read().strip()
+            except Exception:
+                text = ""
+            if text:
+                for ci, part in enumerate(chunk_text(text, CHUNK_SIZE, CHUNK_OVERLAP), start=1):
+                    chunks.append(
+                        DocumentChunk(
+                            id=str(uuid.uuid4()),
+                            text=part,
+                            modality="text",
+                            source_name=name,
+                            page_or_ts="txt-1",
+                            metadata={"chunk_no": ci},
+                        )
+                    )
+                    stats["text"] += 1
+
         elif lname.endswith((".png", ".jpg", ".jpeg")):
+            import pytesseract
+            from PIL import Image
+
             ocr = pytesseract.image_to_string(Image.open(path)).strip()
             vision = image_to_caption(path)
             merged = "\n".join([s for s in [ocr, vision] if s]).strip()

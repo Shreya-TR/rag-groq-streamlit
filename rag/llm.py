@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Dict, List
 
 from config import LLM_MODEL, LOW_CONFIDENCE_THRESHOLD
@@ -35,16 +36,18 @@ def answer(
     history: List[Dict[str, str]] | None = None,
     latency_ms: Dict[str, float] | None = None,
 ) -> AnswerResult:
+    latency = dict(latency_ms or {})
     confidence = _confidence_from_scores(contexts)
     if confidence < LOW_CONFIDENCE_THRESHOLD:
         text = (
             "Insufficient context confidence to answer reliably.\n"
             "Please refine the question or upload more relevant documents."
         )
+        latency["generation_ms"] = 0.0
         return AnswerResult(
             answer=text,
             citations=[c.chunk_id for c in contexts],
-            latency_ms=latency_ms or {},
+            latency_ms=latency,
             confidence=confidence,
             model_id=LLM_MODEL,
         )
@@ -73,23 +76,26 @@ def answer(
     client = _client()
     if client is None:
         fallback = contexts[0].text if contexts else "No context available."
+        latency["generation_ms"] = 0.0
         return AnswerResult(
             answer=f"LLM unavailable (set GROQ_API_KEY). Top context:\n{fallback}",
             citations=[c.chunk_id for c in contexts],
-            latency_ms=latency_ms or {},
+            latency_ms=latency,
             confidence=confidence,
             model_id=LLM_MODEL,
         )
 
+    t0 = time.perf_counter()
     resp = client.chat.completions.create(
         model=LLM_MODEL,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.2,
     )
+    latency["generation_ms"] = round((time.perf_counter() - t0) * 1000, 2)
     return AnswerResult(
         answer=(resp.choices[0].message.content or "").strip(),
         citations=[c.chunk_id for c in contexts],
-        latency_ms=latency_ms or {},
+        latency_ms=latency,
         confidence=confidence,
         model_id=LLM_MODEL,
     )
