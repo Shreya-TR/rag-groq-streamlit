@@ -20,7 +20,7 @@ It combines:
 
 The application is deployed and accessible here:
 
-`https://your-streamlit-app-url.streamlit.app/`
+`https://rag-groq-app-vzx48gfqckwgxgjribnqoc.streamlit.app/`
 
 ---
 
