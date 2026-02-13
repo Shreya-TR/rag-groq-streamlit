@@ -1,8 +1,9 @@
-import os
+﻿import os
+import re
 import tempfile
-from typing import Any, List, Tuple
+from collections import Counter
+from typing import Any, Dict, List, Tuple
 
-import numpy as np
 import pdfplumber
 import pytesseract
 from PIL import Image
@@ -12,16 +13,29 @@ try:
 except ImportError:
     Groq = None
 
-_EMBEDDER = None
+
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"[a-zA-Z0-9]+", text.lower())
 
 
-def _get_embedder():
-    global _EMBEDDER
-    if _EMBEDDER is None:
-        from sentence_transformers import SentenceTransformer
+def _build_sparse_vectors(chunks: List[str]) -> Tuple[List[Dict[str, int]], List[str]]:
+    vectors: List[Dict[str, int]] = []
+    for chunk in chunks:
+        tokens = _tokenize(chunk)
+        vectors.append(dict(Counter(tokens)))
+    return vectors, chunks
 
-        _EMBEDDER = SentenceTransformer("all-MiniLM-L6-v2")
-    return _EMBEDDER
+
+def _cosine_dict(a: Dict[str, int], b: Dict[str, int]) -> float:
+    if not a or not b:
+        return 0.0
+    common = set(a.keys()) & set(b.keys())
+    dot = sum(a[k] * b[k] for k in common)
+    mag_a = sum(v * v for v in a.values()) ** 0.5
+    mag_b = sum(v * v for v in b.values()) ** 0.5
+    if mag_a == 0 or mag_b == 0:
+        return 0.0
+    return dot / (mag_a * mag_b)
 
 
 def extract_pdf_text(path: str) -> str:
@@ -38,11 +52,21 @@ def extract_image_text(path: str) -> str:
     return pytesseract.image_to_string(Image.open(path))
 
 
-def extract_audio_text(path: str, model_size: str = "base") -> str:
-    import whisper
+def extract_audio_text(path: str) -> str:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key or Groq is None:
+        return "Audio transcription unavailable (set GROQ_API_KEY)."
 
-    model = whisper.load_model(model_size)
-    return model.transcribe(path).get("text", "").strip()
+    client = Groq(api_key=api_key)
+    with open(path, "rb") as audio_file:
+        tr = client.audio.transcriptions.create(
+            file=audio_file,
+            model="whisper-large-v3",
+            response_format="verbose_json",
+        )
+
+    text = getattr(tr, "text", "") or ""
+    return text.strip()
 
 
 def chunk_text(text: str, chunk_size: int = 350, overlap: int = 70) -> List[str]:
@@ -52,31 +76,35 @@ def chunk_text(text: str, chunk_size: int = 350, overlap: int = 70) -> List[str]
     if overlap >= chunk_size:
         overlap = max(0, chunk_size // 5)
     step = max(1, chunk_size - overlap)
-    return [
-        " ".join(words[i : i + chunk_size]).strip()
-        for i in range(0, len(words), step)
-        if " ".join(words[i : i + chunk_size]).strip()
-    ]
+    chunks: List[str] = []
+    for i in range(0, len(words), step):
+        chunk = " ".join(words[i : i + chunk_size]).strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
 
 
 def build_faiss_index(chunks: List[str]) -> Tuple[Any, List[str]]:
-    import faiss
-
     if not chunks:
         raise ValueError("No chunks found to index.")
-    embeddings = _get_embedder().encode(chunks, convert_to_numpy=True)
-    embeddings = np.asarray(embeddings, dtype=np.float32)
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
-    return index, chunks
+    # Kept function name for app compatibility; internally this is a sparse-token index.
+    return _build_sparse_vectors(chunks)
 
 
 def retrieve(query: str, index: Any, chunks: List[str], top_k: int = 3) -> List[str]:
-    q_emb = _get_embedder().encode([query], convert_to_numpy=True)
-    q_emb = np.asarray(q_emb, dtype=np.float32)
-    top_k = min(top_k, len(chunks))
-    _, idxs = index.search(q_emb, top_k)
-    return [chunks[i] for i in idxs[0] if 0 <= i < len(chunks)]
+    query_vec = dict(Counter(_tokenize(query)))
+    scored: List[Tuple[float, int]] = []
+
+    for i, chunk_vec in enumerate(index):
+        score = _cosine_dict(query_vec, chunk_vec)
+        scored.append((score, i))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [i for score, i in scored[: max(1, min(top_k, len(scored)))] if score > 0]
+
+    if not top:
+        return chunks[: min(top_k, len(chunks))]
+    return [chunks[i] for i in top]
 
 
 def _resolve_client_and_model():
